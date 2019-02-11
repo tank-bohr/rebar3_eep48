@@ -1,0 +1,9 @@
+{application, rebar3_eep48,
+ [{description, "Rebar plugin to compile eep48-compliant beam"},
+  {vsn, "0.1.0"},
+  {applications, [kernel, stdlib, edown]},
+  {licenses, ["Apache 2.0"]},
+  {links, [
+    {"Github", "https://github.com/tank-bohr/rebar3_eep48"}
+  ]}
+ ]}.
