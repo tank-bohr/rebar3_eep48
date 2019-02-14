@@ -1,6 +1,7 @@
 -module(rebar3_eep48).
 
 -include_lib("edoc/src/edoc.hrl").
+-include_lib("edoc/src/edoc_types.hrl").
 
 -export([
     init/1,
@@ -11,9 +12,6 @@
 -define(PROVIDER, eep48).
 -define(DEPS, [app_discovery]).
 
-%% ===================================================================
-%% Public API
-%% ===================================================================
 -spec init(rebar_state:t()) -> {ok, rebar_state:t()}.
 init(State) ->
     Provider = providers:create([
@@ -28,7 +26,6 @@ init(State) ->
             {profiles, [eep48]}
     ]),
     {ok, rebar_state:add_provider(State, Provider)}.
-
 
 -spec do(rebar_state:t()) -> {ok, rebar_state:t()} | {error, string()}.
 do(State) ->
@@ -45,24 +42,33 @@ format_error(Reason) ->
 do_app(State, AppInfo) ->
     Name = rebar_app_info:name(AppInfo),
     rebar_api:info("Running eep48 on application ~s", [Name]),
+    #{
+        src_dirs     := SrcDirs,
+        include_dirs := IncDirs
+    } = rebar_compiler_erl:context(AppInfo),
     BaseDir = rebar_app_info:dir(AppInfo),
+    AbsSrcDirs = abs_dirs(BaseDir, SrcDirs),
+    AbsIncDirs = abs_dirs(BaseDir, IncDirs),
     EbinDir = rebar_app_info:ebin_dir(AppInfo),
-    ok = edocc(BaseDir, EbinDir),
+    ok = edocc(AbsSrcDirs, AbsIncDirs, EbinDir),
     rebar_api:debug("Compile app.src for ~s", [Name]),
     {ok, _} = rebar_otp_app:compile(State, AppInfo).
 
-edocc(Dir, OutDir) ->
-    SrcDir = filename:join(Dir, src),
-    IncludeDir = filename:join(Dir, include),
-    SrcList = filelib:wildcard(SrcDir ++ "/*.erl"),
-    ok = mkdir_p(OutDir),
+edocc(SrcDirs, IncDirs, OutDir) ->
+    rebar_api:debug("Source dirs are: ~p", [SrcDirs]),
+    rebar_api:debug("Include dirs are: ~p", [IncDirs]),
     rebar_api:info("BEAM-files will be available in ~s dir", [OutDir]),
+    SrcList = lists:flatmap(fun(SrcDir) ->
+        filelib:wildcard(SrcDir ++ "/*.erl")
+    end, SrcDirs),
+    ok = mkdir_p(OutDir),
     lists:foreach(fun(Src) ->
         rebar_api:info("Compile ~s with eep48", [Src]),
-        compile_with_docs_chunk(Src, SrcDir, IncludeDir, OutDir)
+        compile_with_docs_chunk(Src, IncDirs, OutDir)
     end, SrcList).
 
-compile_with_docs_chunk(Src, SrcDir, IncludeDir, OutDir) ->
+compile_with_docs_chunk(Src, IncDirs, OutDir) ->
+    rebar_api:debug("Compile with `Docs` chunk: [~s]", [Src]),
     Docs = edocs(Src),
     DocsChunkData = term_to_binary(Docs, [compressed]),
     ExtraChunks = [{<<"Docs">>, DocsChunkData}],
@@ -70,8 +76,7 @@ compile_with_docs_chunk(Src, SrcDir, IncludeDir, OutDir) ->
         debug_info,
         {extra_chunks, ExtraChunks},
         {outdir, OutDir},
-        {i, IncludeDir},
-        {i, SrcDir}
+        {i, IncDirs}
     ]).
 
 edocs(Src) ->
@@ -96,13 +101,31 @@ get_entry(Name, [#entry{name = Name} = E | _Es]) -> E;
 get_entry(Name, [_ | Es]) -> get_entry(Name, Es).
 
 function_docs(Entries) ->
-    lists:filtermap(fun function_doc/1, Entries).
+    lists:flatten(lists:filtermap(fun function_doc/1, Entries)).
 
-function_doc(#entry{data = [#tag{name = private}]}) ->
-    false;
-function_doc(#entry{name = {_Name, _Arity}} = Entry) ->
-    {true, process_function_entry(Entry)};
+function_doc(#entry{name = {_Name, _Arity}, data = Tags} = Entry) ->
+    IsPrivate = lists:any(fun is_private/1, Tags),
+    Types = lists:filter(fun is_type/1, Tags),
+    case {IsPrivate, Types} of
+        {true, []} ->
+            false;
+        {false, _} ->
+            {true, [process_function_entry(Entry) | process_types(Types)]};
+        {true, _} ->
+            {true, process_types(Types)}
+    end;
 function_doc(_) ->
+    false.
+
+is_private(#tag{name = private}) ->
+    true;
+is_private(_) ->
+    false.
+
+%% ex_doc doesn't see type from comments
+is_type(#tag{name = type, origin = code}) ->
+    true;
+is_type(_) ->
     false.
 
 process_function_entry(#entry{name = {Name, Arity}, line = Line, args = Args, data = Data}) ->
@@ -112,6 +135,28 @@ process_function_entry(#entry{name = {Name, Arity}, line = Line, args = Args, da
         erl_anno:new(Line),
         signature(Name, Args),
         #{ <<"en">> => doc_string(Data) },
+        #{}
+    }.
+
+process_types(Types) ->
+    lists:map(fun process_type_tag/1, Types).
+
+process_type_tag(#tag{
+    name = type,
+    line = Line,
+    data = {
+        #t_typedef{
+            name = #t_name{name = Name},
+            args = Args
+        },
+        Xml
+    }
+}) ->
+    {
+        {type, Name, length(Args)},
+        erl_anno:new(Line),
+        [],
+        #{ <<"en">> => type_doc(Xml) },
         #{}
     }.
 
@@ -128,12 +173,20 @@ tag_to_markdown(#tag{name = doc, data = Xml}) ->
 tag_to_markdown(_) ->
     "".
 
+type_doc([]) ->
+    nil;
+type_doc(Xml) ->
+    list_to_binary(xmerl:export_simple(Xml, edown_xmerl)).
+
+abs_dirs(BaseDir, Dirs) ->
+    lists:map(fun(Dir) -> filename:join(BaseDir, Dir) end, Dirs).
+
 mkdir_p(Dir) ->
     ok = filelib:ensure_dir(Dir),
     case file:make_dir(Dir) of
         ok ->
             ok;
-        {error,eexist} ->
+        {error, eexist} ->
             ok;
         Error ->
             Error
